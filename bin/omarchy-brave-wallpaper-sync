@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""
+omarchy-brave-wallpaper-sync
+
+Synchronizes Omarchy desktop wallpaper with Brave NTP backgrounds.
+Generates a unique crop per Brave window.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+OMARCHY_BG_LINK = Path.home() / ".config/omarchy/current/background"
+BRAVE_CONFIG_DIR = Path.home() / ".config/BraveSoftware/Brave-Origin-Beta"
+CROP_SCRIPT = Path.home() / ".local/bin/omarchy-brave-ntp-crop"
+REFRESH_SCRIPT = Path.home() / ".local/bin/omarchy-brave-ntp-refresh"
+IMAGE_NAME = "omarchy-wallpaper-cropped.png"
+CROPS_DIR = Path("/tmp/omarchy-brave-crops")
+
+
+def get_omarchy_wallpaper():
+    if not OMARCHY_BG_LINK.exists():
+        return None
+    return OMARCHY_BG_LINK.resolve()
+
+
+def find_brave_profiles():
+    profiles = []
+    if not BRAVE_CONFIG_DIR.exists():
+        return profiles
+    for entry in BRAVE_CONFIG_DIR.iterdir():
+        if entry.is_dir() and (entry / "Preferences").exists():
+            profiles.append(entry.name)
+    return profiles if profiles else ["Default"]
+
+
+def ensure_sanitized_dir(profile):
+    sanitized_dir = BRAVE_CONFIG_DIR / profile / "sanitized_background_images"
+    sanitized_dir.mkdir(parents=True, exist_ok=True)
+    return sanitized_dir
+
+
+def get_brave_windows():
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "clients"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return []
+        clients = json.loads(result.stdout)
+        return [c for c in clients if "brave" in c.get("class", "").lower()]
+    except Exception:
+        return []
+
+
+def generate_window_crop(wallpaper_path, window):
+    address = window.get("address", "unknown")
+    output_path = CROPS_DIR / f"{address}.png"
+    geom = f"{window['at'][0]},{window['at'][1]},{window['size'][0]},{window['size'][1]},{window['monitor']}"
+    try:
+        result = subprocess.run(
+            [sys.executable, str(CROP_SCRIPT),
+             "--window-geometry", geom,
+             "--output", str(output_path)],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return output_path
+    except Exception as e:
+        print(f"Crop failed for {address}: {e}", file=sys.stderr)
+    return None
+
+
+def sync_wallpaper():
+    wallpaper = get_omarchy_wallpaper()
+    if not wallpaper:
+        print("No Omarchy wallpaper found.", file=sys.stderr)
+        return 1
+
+    print(f"Syncing Omarchy wallpaper: {wallpaper}")
+
+    profiles = find_brave_profiles()
+    if not profiles:
+        print("No Brave profiles found.", file=sys.stderr)
+        return 1
+
+    CROPS_DIR.mkdir(parents=True, exist_ok=True)
+
+    windows = get_brave_windows()
+    print(f"Found {len(windows)} Brave window(s)")
+
+    addr_to_crop = {}
+    for window in windows:
+        address = window.get("address")
+        if not address:
+            continue
+        crop_path = generate_window_crop(wallpaper, window)
+        if crop_path:
+            addr_to_crop[address] = crop_path
+            print(f"Generated crop for window {address[:8]}...")
+
+    # Copy one crop as fallback for Preferences
+    fallback_crop = None
+    if addr_to_crop:
+        try:
+            active = json.loads(subprocess.run(
+                ["hyprctl", "-j", "activewindow"],
+                capture_output=True, text=True, timeout=2
+            ).stdout)
+            if active and "brave" in active.get("class", "").lower():
+                addr = active.get("address")
+                if addr in addr_to_crop:
+                    fallback_crop = addr_to_crop[addr]
+        except Exception:
+            pass
+        if not fallback_crop:
+            fallback_crop = list(addr_to_crop.values())[0]
+
+    for profile in profiles:
+        sanitized_dir = ensure_sanitized_dir(profile)
+        dest_path = sanitized_dir / IMAGE_NAME
+        if fallback_crop and fallback_crop.exists():
+            shutil.copy2(fallback_crop, dest_path)
+        else:
+            subprocess.run(["convert", str(wallpaper), str(dest_path)], capture_output=True, timeout=30)
+        print(f"Updated fallback for profile: {profile}")
+
+    # Run the refresh script for per-tab injection
+    if REFRESH_SCRIPT.exists():
+        try:
+            result = subprocess.run(
+                [sys.executable, str(REFRESH_SCRIPT)],
+                capture_output=True, text=True, timeout=60
+            )
+            if result.stdout:
+                print(result.stdout.strip())
+            if result.stderr:
+                print(result.stderr.strip(), file=sys.stderr)
+        except Exception as e:
+            print(f"Refresh failed: {e}", file=sys.stderr)
+
+    print("Sync complete.")
+    return 0
+
+
+def main():
+    return sync_wallpaper()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

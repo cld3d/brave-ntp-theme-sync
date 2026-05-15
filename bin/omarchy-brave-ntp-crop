@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+omarchy-brave-ntp-crop
+
+Calculates and generates a cropped wallpaper image that corresponds to
+the portion of the desktop wallpaper visible behind the Brave window's
+NTP content area (below tabs/toolbar).
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+OMARCHY_BG_LINK = Path.home() / ".config/omarchy/current/background"
+
+CHROME_HEIGHT_FILE = Path.home() / ".config/omarchy/brave-chrome-height"
+OFFSET_FILE = Path.home() / ".config/omarchy/brave-vertical-offset"
+DEFAULT_CHROME_HEIGHT = 84
+
+
+def get_chrome_height():
+    env_height = os.environ.get("BRAVE_CHROME_HEIGHT")
+    if env_height:
+        return int(env_height)
+    if CHROME_HEIGHT_FILE.exists():
+        try:
+            return int(CHROME_HEIGHT_FILE.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    return DEFAULT_CHROME_HEIGHT
+
+
+def get_vertical_offset():
+    env_offset = os.environ.get("BRAVE_VERTICAL_OFFSET")
+    if env_offset:
+        return int(env_offset)
+    if OFFSET_FILE.exists():
+        try:
+            return int(OFFSET_FILE.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    return 0
+
+
+BRAVE_CHROME_HEIGHT_LOGICAL = get_chrome_height()
+VERTICAL_OFFSET = get_vertical_offset()
+
+
+def get_active_window():
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "activewindow"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return None
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"Failed to get active window: {e}", file=sys.stderr)
+        return None
+
+
+def get_monitors():
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "monitors"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return []
+        return json.loads(result.stdout)
+    except Exception as e:
+        print(f"Failed to get monitors: {e}", file=sys.stderr)
+        return []
+
+
+def get_brave_windows():
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "clients"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return []
+        clients = json.loads(result.stdout)
+        return [c for c in clients if "brave" in c.get("class", "").lower()]
+    except Exception as e:
+        print(f"Failed to get clients: {e}", file=sys.stderr)
+        return []
+
+
+def get_wallpaper_dimensions(path):
+    try:
+        result = subprocess.run(
+            ["identify", "-format", "%w %h", str(path)],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        w, h = result.stdout.strip().split()
+        return int(w), int(h)
+    except Exception as e:
+        print(f"Failed to identify image: {e}", file=sys.stderr)
+        return None
+
+
+def calculate_crop(monitor, window, wallpaper_w, wallpaper_h):
+    scale = monitor["scale"]
+    mon_x = monitor.get("x", 0)
+    mon_y = monitor.get("y", 0)
+    phys_mw = monitor["width"]
+    phys_mh = monitor["height"]
+
+    win_rel_x = window["at"][0] - mon_x
+    win_rel_y = window["at"][1] - mon_y
+
+    phys_wx = win_rel_x * scale
+    phys_wy = win_rel_y * scale
+    phys_ww = window["size"][0] * scale
+    phys_wh = window["size"][1] * scale
+
+    chrome_h = BRAVE_CHROME_HEIGHT_LOGICAL * scale
+    offset_physical = VERTICAL_OFFSET * scale
+    content_y = phys_wy + chrome_h + offset_physical
+    content_h = phys_wh - chrome_h
+
+    if content_h <= 0:
+        return None
+
+    img_scale = max(phys_mw / wallpaper_w, phys_mh / wallpaper_h)
+    rw = wallpaper_w * img_scale
+    rh = wallpaper_h * img_scale
+    ox = (phys_mw - rw) / 2
+    oy = (phys_mh - rh) / 2
+
+    ix1 = max(phys_wx, ox)
+    iy1 = max(content_y, oy)
+    ix2 = min(phys_wx + phys_ww, ox + rw)
+    iy2 = min(content_y + content_h, oy + rh)
+
+    if ix1 >= ix2 or iy1 >= iy2:
+        return None
+
+    return {
+        "x": max(0, round((ix1 - ox) / img_scale)),
+        "y": max(0, round((iy1 - oy) / img_scale)),
+        "w": max(1, round((ix2 - ix1) / img_scale)),
+        "h": max(1, round((iy2 - iy1) / img_scale)),
+    }
+
+
+def generate_crop(wallpaper_path, crop, output_path):
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "magick", str(wallpaper_path),
+        "-crop", f"{crop['w']}x{crop['h']}+{crop['x']}+{crop['y']}",
+        "+repage",
+        "-define", "png:color-type=6",
+        str(output_path)
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            cmd2 = [
+                "convert", str(wallpaper_path),
+                "-crop", f"{crop['w']}x{crop['h']}+{crop['x']}+{crop['y']}",
+                "+repage",
+                "-define", "png:color-type=6",
+                str(output_path)
+            ]
+            subprocess.run(cmd2, capture_output=True, timeout=30)
+        return output_path.exists() and output_path.stat().st_size > 0
+    except Exception as e:
+        print(f"Failed to generate crop: {e}", file=sys.stderr)
+        return False
+
+
+def crop_for_window(window, wallpaper_path, monitors, output_path):
+    dims = get_wallpaper_dimensions(wallpaper_path)
+    if not dims:
+        return False
+    iw, ih = dims
+
+    monitor_id = window.get("monitor")
+    monitor = None
+    for m in monitors:
+        if m.get("id") == monitor_id:
+            monitor = m
+            break
+
+    if not monitor:
+        return False
+
+    crop = calculate_crop(monitor, window, iw, ih)
+    if not crop:
+        return False
+
+    return generate_crop(wallpaper_path, crop, output_path)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--window-address", help="Target window address")
+    parser.add_argument("--output", "-o", required=True)
+    parser.add_argument("--window-geometry", help="at_x,at_y,w,h,monitor_id")
+    args = parser.parse_args()
+
+    wallpaper = OMARCHY_BG_LINK.resolve() if OMARCHY_BG_LINK.exists() else None
+    if not wallpaper:
+        print("No Omarchy wallpaper found.", file=sys.stderr)
+        return 1
+
+    monitors = get_monitors()
+    if not monitors:
+        print("No monitors found.", file=sys.stderr)
+        return 1
+
+    target_window = None
+
+    if args.window_geometry:
+        parts = args.window_geometry.split(",")
+        if len(parts) == 5:
+            target_window = {
+                "at": [int(parts[0]), int(parts[1])],
+                "size": [int(parts[2]), int(parts[3])],
+                "monitor": int(parts[4]),
+            }
+        else:
+            print(f"Invalid geometry: {args.window_geometry}", file=sys.stderr)
+            return 1
+    elif args.window_address:
+        windows = get_brave_windows()
+        for w in windows:
+            if w.get("address") == args.window_address:
+                target_window = w
+                break
+        if not target_window:
+            print(f"Window {args.window_address} not found.", file=sys.stderr)
+            return 1
+    else:
+        target_window = get_active_window()
+        if not target_window or "brave" not in target_window.get("class", "").lower():
+            windows = get_brave_windows()
+            if windows:
+                target_window = min(windows, key=lambda w: w.get("focusHistoryID", 999))
+
+    if not target_window:
+        subprocess.run(["convert", str(wallpaper), args.output], capture_output=True, timeout=30)
+        print(args.output)
+        return 0
+
+    if crop_for_window(target_window, wallpaper, monitors, Path(args.output)):
+        print(args.output)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

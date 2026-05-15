@@ -1,0 +1,75 @@
+#!/bin/bash
+# Tune Brave NTP wallpaper alignment
+
+CONFIG_DIR="$HOME/.config/omarchy"
+HEIGHT_FILE="$CONFIG_DIR/brave-chrome-height"
+OFFSET_FILE="$CONFIG_DIR/brave-vertical-offset"
+
+show_current() {
+    echo "Current settings:"
+    if [[ -f $HEIGHT_FILE ]]; then
+        echo "  Chrome height: $(cat "$HEIGHT_FILE")"
+    else
+        echo "  Chrome height: 84 (default)"
+    fi
+    if [[ -f $OFFSET_FILE ]]; then
+        echo "  Vertical offset: $(cat "$OFFSET_FILE")"
+    else
+        echo "  Vertical offset: 0 (default)"
+    fi
+    echo ""
+}
+
+show_usage() {
+    echo "Usage:"
+    echo "  $0 height <value>    - Set chrome height (tabs+toolbar)"
+    echo "  $0 offset <value>    - Set vertical offset (shifts image up/down)"
+    echo ""
+    echo "Height:"
+    echo "  Increase if image is too HIGH"
+    echo "  Decrease if image is too LOW"
+    echo ""
+    echo "Offset:"
+    echo "  Positive = shift image DOWN"
+    echo "  Negative = shift image UP"
+    echo ""
+    echo "Examples:"
+    echo "  $0 offset 5     # Shift image down 5px"
+    echo "  $0 offset -3    # Shift image up 3px"
+    echo ""
+    echo "Move/resize the Brave window after changing to see the effect."
+}
+
+# Show current values
+show_current
+
+# Parse arguments
+if [[ $# -lt 2 ]]; then
+    show_usage
+    exit 0
+fi
+
+MODE="$1"
+VALUE="$2"
+
+case "$MODE" in
+    height)
+        echo "Setting chrome height to: $VALUE"
+        echo "$VALUE" > "$HEIGHT_FILE"
+        ;;
+    offset)
+        echo "Setting vertical offset to: $VALUE"
+        echo "$VALUE" > "$OFFSET_FILE"
+        ;;
+    *)
+        echo "Unknown mode: $MODE"
+        show_usage
+        exit 1
+        ;;
+esac
+
+# Trigger an immediate sync
+~/.local/bin/omarchy-brave-wallpaper-sync 2>&1 | tail -3
+
+echo ""
+echo "Done! Move or resize the Brave window to see the effect."

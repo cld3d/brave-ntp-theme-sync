@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+USER_FLAGS_FILE="$XDG_CONFIG_HOME/brave-origin-beta-flags.conf"
+USER_FLAGS=()
+if [[ -f $USER_FLAGS_FILE ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+        [[ "$line" =~ ^# ]] && continue
+        USER_FLAGS+=("$line")
+    done < "$USER_FLAGS_FILE"
+fi
+
+if [[ -z "${CHROME_USER_DATA_DIR}" ]]; then
+    export CHROME_USER_DATA_DIR=~/.config/BraveSoftware/Brave-Origin-Beta
+fi
+exec "/opt/brave.com/brave-origin-beta/brave-origin" "${USER_FLAGS[@]}" "$BRAVE_FLAGS" "$FLAG" "$@"

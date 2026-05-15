@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+omarchy-brave-ntp-refresh
+
+Maps NTP tabs to Hyprland windows via Target.activateTarget,
+then injects cropped wallpaper as data URLs per tab.
+"""
+
+import asyncio
+import base64
+import json
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+CDP_PORT = 9222
+CROPS_DIR = Path("/tmp/omarchy-brave-crops")
+FALLBACK_DIR = Path.home() / ".config/BraveSoftware/Brave-Origin-Beta/Default/sanitized_background_images"
+
+
+def get_ntp_tabs():
+    try:
+        req = urllib.request.Request(f"http://localhost:{CDP_PORT}/json/list")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            tabs = json.loads(resp.read().decode())
+        ntps = []
+        for tab in tabs:
+            url = tab.get("url", "")
+            if url.startswith("chrome://newtab/") or url.startswith("brave://newtab/"):
+                ntps.append(tab)
+        return ntps
+    except Exception as e:
+        print(f"Failed to list tabs: {e}", file=sys.stderr)
+        return []
+
+
+def get_brave_windows():
+    try:
+        result = subprocess.run(
+            ["hyprctl", "-j", "clients"],
+            capture_output=True, text=True, timeout=2
+        )
+        if result.returncode != 0:
+            return []
+        clients = json.loads(result.stdout)
+        return [c for c in clients if "brave" in c.get("class", "").lower()]
+    except Exception:
+        return []
+
+
+def get_focused_brave_window(windows):
+    for w in windows:
+        if w.get("focusHistoryID", 999) == 0:
+            return w
+    return None
+
+
+def image_to_data_url(path):
+    try:
+        data = path.read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        return f"data:image/png;base64,{b64}"
+    except Exception as e:
+        print(f"Failed to read image {path}: {e}", file=sys.stderr)
+        return None
+
+
+async def activate_tab(tab, browser_ws):
+    tab_id = tab.get("id")
+    if not tab_id or not browser_ws:
+        return False
+    try:
+        import websockets
+        async with websockets.connect(browser_ws) as ws:
+            await ws.send(json.dumps({
+                "id": 1, "method": "Target.activateTarget",
+                "params": {"targetId": tab_id}
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+async def inject_wallpaper(tab, data_url):
+    ws_url = tab.get("webSocketDebuggerUrl")
+    if not ws_url:
+        return False
+
+    js = f"""
+(function() {{
+  const url = '{data_url}';
+  const style = document.createElement('style');
+  style.id = 'omarchy-bg';
+  style.textContent = 'html, body, .image-background {{ background-image: url("' + url + '") !important; background-size: cover !important; background-position: center !important; background-repeat: no-repeat !important; }}';
+  document.head.appendChild(style);
+  if (document.body) {{
+    document.body.style.setProperty('background-image', 'url("' + url + '")', 'important');
+    document.body.style.setProperty('background-size', 'cover', 'important');
+    document.body.style.setProperty('background-position', 'center', 'important');
+    document.body.style.setProperty('background-repeat', 'no-repeat', 'important');
+  }}
+  var el = document.querySelector('.image-background');
+  if (el) {{
+    el.style.setProperty('background-image', 'url("' + url + '")', 'important');
+    el.style.setProperty('background-size', 'cover', 'important');
+    el.style.setProperty('background-position', 'center', 'important');
+    el.style.setProperty('background-repeat', 'no-repeat', 'important');
+  }}
+  return true;
+}})();
+"""
+
+    try:
+        import websockets
+        async with websockets.connect(ws_url) as ws:
+            await ws.send(json.dumps({
+                "id": 1, "method": "Runtime.evaluate",
+                "params": {"expression": js, "returnByValue": True}
+            }))
+            resp = await asyncio.wait_for(ws.recv(), timeout=15)
+            result = json.loads(resp)
+            val = result.get("result", {}).get("result", {})
+            return val.get("type") == "boolean" and val.get("value") == True
+    except Exception as e:
+        print(f"Injection failed: {e}", file=sys.stderr)
+    return False
+
+
+async def main_async():
+    tabs = get_ntp_tabs()
+    if not tabs:
+        print("No NTP tabs found")
+        return 1
+
+    windows = get_brave_windows()
+    if not windows:
+        print("No Brave windows found")
+        return 1
+
+    print(f"Found {len(tabs)} NTP tab(s) and {len(windows)} Brave window(s)")
+
+    # Get browser WS URL
+    browser_ws = None
+    try:
+        req = urllib.request.Request(f"http://localhost:{CDP_PORT}/json/version")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            browser_ws = json.loads(resp.read().decode()).get("webSocketDebuggerUrl")
+    except Exception:
+        pass
+
+    if not browser_ws:
+        print("Failed to connect to CDP browser endpoint")
+        return 1
+
+    # Save original workspaces per monitor
+    orig_workspaces = {}
+    try:
+        mons = json.loads(subprocess.run(
+            ["hyprctl", "-j", "monitors"], capture_output=True, text=True, timeout=2
+        ).stdout)
+        for m in mons:
+            ws = m.get("activeWorkspace", {}).get("id")
+            if ws is not None:
+                orig_workspaces[m["name"]] = ws
+    except Exception:
+        pass
+
+    # Get windowIds for all tabs
+    async def get_window_id(tab):
+        try:
+            import websockets
+            async with websockets.connect(browser_ws) as ws:
+                await ws.send(json.dumps({
+                    "id": 1, "method": "Browser.getWindowForTarget",
+                    "params": {"targetId": tab["id"]}
+                }))
+                resp = await asyncio.wait_for(ws.recv(), timeout=5)
+                r = json.loads(resp)
+                return r.get("result", {}).get("windowId")
+        except Exception:
+            pass
+        return None
+
+    wid_results = await asyncio.gather(*[get_window_id(t) for t in tabs])
+    wid_groups = {}
+    for tab, wid in zip(tabs, wid_results):
+        if wid is not None:
+            wid_groups.setdefault(wid, []).append(tab)
+
+    # Map each windowId group to a Hyprland window by activation
+    tab_to_address = {}
+    prev_focused = None
+    for wid, group in wid_groups.items():
+        first_tab = group[0]
+        await activate_tab(first_tab, browser_ws)
+        windows = get_brave_windows()
+        focused = get_focused_brave_window(windows)
+        if focused and focused.get("address") != prev_focused:
+            addr = focused.get("address")
+            prev_focused = addr
+            for t in group:
+                tab_to_address[t.get("id")] = addr
+            print(f"  window at {focused['at']} ({len(group)} tab(s))")
+        elif focused:
+            print(f"  Skipping window (no focus change)")
+
+    # Restore original workspaces
+    for mon_name, ws_id in orig_workspaces.items():
+        subprocess.run(["hyprctl", "dispatch", "focusmonitor", mon_name], capture_output=True, timeout=2)
+        subprocess.run(["hyprctl", "dispatch", "workspace", str(ws_id)], capture_output=True, timeout=2)
+        print(f"  Restored {mon_name} to workspace {ws_id}")
+
+    # Build data URLs for each window's crop
+    addr_to_tabs = {}
+    for tab in tabs:
+        addr = tab_to_address.get(tab.get("id"))
+        if addr:
+            addr_to_tabs.setdefault(addr, []).append(tab)
+
+    # Inject data URLs per window
+    success = False
+    for addr, group_tabs in addr_to_tabs.items():
+        crop_path = CROPS_DIR / f"{addr}.png"
+        if not crop_path.exists() or not crop_path.stat().st_size > 0:
+            continue
+        data_url = image_to_data_url(crop_path)
+        if not data_url:
+            continue
+        results = await asyncio.gather(*[inject_wallpaper(t, data_url) for t in group_tabs])
+        for tab, injected in zip(group_tabs, results):
+            if injected:
+                print(f"  Injected into tab {tab['id'][:8]}...")
+                success = True
+
+    # Unmapped tabs get fallback
+    fallback_img = FALLBACK_DIR / "omarchy-wallpaper-cropped.png"
+    if fallback_img.exists():
+        fallback_data = image_to_data_url(fallback_img)
+        if fallback_data:
+            for tab in tabs:
+                if tab.get("id") not in tab_to_address:
+                    if await inject_wallpaper(tab, fallback_data):
+                        print(f"  Injected fallback into tab {tab['id'][:8]}...")
+                        success = True
+
+    return 0 if success else 1
+
+
+def main():
+    return asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

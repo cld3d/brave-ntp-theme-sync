@@ -1,0 +1,81 @@
+#!/bin/bash
+
+# Watch the Omarchy wallpaper symlink for changes and sync to Brave.
+# Polls Brave window geometry with debounce.
+
+WALLPAPER_LINK="$HOME/.config/omarchy/current/background"
+SYNC_SCRIPT="$HOME/.local/bin/omarchy-brave-wallpaper-sync"
+GEOM_FILE="/tmp/omarchy-brave-ntp-last-geom"
+STABLE_COUNT=5
+POLL_INTERVAL=0.2
+SYNC_PID_FILE="/tmp/omarchy-brave-sync-running"
+
+if [[ ! -L $WALLPAPER_LINK ]]; then
+    echo "Omarchy wallpaper link not found: $WALLPAPER_LINK"
+    exit 1
+fi
+
+get_brave_geoms() {
+    hyprctl -j clients 2>/dev/null | python3 -c "
+import sys, json
+try:
+    clients = json.load(sys.stdin)
+    brave = [c for c in clients if 'brave' in c.get('class', '').lower()]
+    sigs = []
+    for w in sorted(brave, key=lambda x: x.get('address', '')):
+        sigs.append(f\"{w['address']},{w['at'][0]},{w['at'][1]},{w['size'][0]},{w['size'][1]}\")
+    print(';'.join(sigs))
+except Exception:
+    pass
+" 2>/dev/null
+}
+
+run_sync_once() {
+    # Only run if no other sync is in progress
+    if [[ -f $SYNC_PID_FILE ]] && kill -0 "$(cat "$SYNC_PID_FILE")" 2>/dev/null; then
+        return
+    fi
+    "$SYNC_SCRIPT" >/dev/null 2>&1 &
+    local pid=$!
+    echo "$pid" > "$SYNC_PID_FILE"
+    wait $pid 2>/dev/null || true
+    rm -f "$SYNC_PID_FILE"
+}
+
+# Debounced geometry polling
+(
+    last_geom=""
+    stable_tally=0
+    handled_geom=""
+
+    while true; do
+        sleep $POLL_INTERVAL
+
+        geom=$(get_brave_geoms)
+        [[ -z $geom ]] && continue
+
+        # Geometry changed — reset
+        if [[ $geom != "$last_geom" ]]; then
+            last_geom="$geom"
+            stable_tally=0
+            continue
+        fi
+
+        [[ $geom == "$handled_geom" ]] && continue
+
+        ((stable_tally++))
+        if (( stable_tally >= STABLE_COUNT )); then
+            handled_geom="$geom"
+            stable_tally=0
+            echo "$geom" > "$GEOM_FILE"
+            run_sync_once &
+        fi
+    done
+) &
+
+# Main loop: watch wallpaper symlink
+while true; do
+    inotifywait -e modify,attrib,move,create,delete "$(dirname "$WALLPAPER_LINK")" 2>/dev/null
+    sleep 1
+    run_sync_once &
+done
