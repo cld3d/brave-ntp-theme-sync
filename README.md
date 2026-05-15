@@ -14,7 +14,7 @@ cropped to match the desktop region visible behind each Brave window.
 ## Quick Start
 
 ```bash
-git clone https://github.com/your-username/brave-ntp-theme-sync ~/brave-ntp-theme-sync
+git clone https://github.com/cld3d/brave-ntp-theme-sync ~/brave-ntp-theme-sync
 cd ~/brave-ntp-theme-sync
 ./install.sh
 ```
