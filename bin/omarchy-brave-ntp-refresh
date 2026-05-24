@@ -2,7 +2,7 @@
 """
 omarchy-brave-ntp-refresh
 
-Maps NTP tabs to Hyprland windows via Target.activateTarget,
+Maps NTP tabs to Hyprland windows via Browser.getWindowBounds,
 then injects cropped wallpaper as data URLs per tab.
 """
 
@@ -49,13 +49,6 @@ def get_brave_windows():
         return []
 
 
-def get_focused_brave_window(windows):
-    for w in windows:
-        if w.get("focusHistoryID", 999) == 0:
-            return w
-    return None
-
-
 def image_to_data_url(path):
     try:
         data = path.read_bytes()
@@ -64,24 +57,6 @@ def image_to_data_url(path):
     except Exception as e:
         print(f"Failed to read image {path}: {e}", file=sys.stderr)
         return None
-
-
-async def activate_tab(tab, browser_ws):
-    tab_id = tab.get("id")
-    if not tab_id or not browser_ws:
-        return False
-    try:
-        import websockets
-        async with websockets.connect(browser_ws) as ws:
-            await ws.send(json.dumps({
-                "id": 1, "method": "Target.activateTarget",
-                "params": {"targetId": tab_id}
-            }))
-            await asyncio.wait_for(ws.recv(), timeout=5)
-            return True
-    except Exception:
-        pass
-    return False
 
 
 async def inject_wallpaper(tab, data_url):
@@ -155,21 +130,8 @@ async def main_async():
         print("Failed to connect to CDP browser endpoint")
         return 1
 
-    # Save original workspaces per monitor
-    orig_workspaces = {}
-    try:
-        mons = json.loads(subprocess.run(
-            ["hyprctl", "-j", "monitors"], capture_output=True, text=True, timeout=2
-        ).stdout)
-        for m in mons:
-            ws = m.get("activeWorkspace", {}).get("id")
-            if ws is not None:
-                orig_workspaces[m["name"]] = ws
-    except Exception:
-        pass
-
-    # Get windowIds for all tabs
-    async def get_window_id(tab):
+    # Get windowId and bounds for each tab via CDP
+    async def get_window_info(tab):
         try:
             import websockets
             async with websockets.connect(browser_ws) as ws:
@@ -179,49 +141,75 @@ async def main_async():
                 }))
                 resp = await asyncio.wait_for(ws.recv(), timeout=5)
                 r = json.loads(resp)
-                return r.get("result", {}).get("windowId")
+                result = r.get("result", {})
+                wid = result.get("windowId")
+                bounds = result.get("bounds", {})
+                return wid, bounds
         except Exception:
             pass
-        return None
+        return None, None
 
-    wid_results = await asyncio.gather(*[get_window_id(t) for t in tabs])
+    winfo_results = await asyncio.gather(*[get_window_info(t) for t in tabs])
     wid_groups = {}
-    for tab, wid in zip(tabs, wid_results):
+    wid_bounds = {}
+    for tab, (wid, bounds) in zip(tabs, winfo_results):
         if wid is not None:
             wid_groups.setdefault(wid, []).append(tab)
+            wid_bounds[wid] = bounds
 
-    # Map each windowId group to a Hyprland window by activation
+    TOLERANCE = 5
+
+    # Match CDP windows to Hyprland windows by bounds
+    wid_to_address = {}
+    for wid, group_tabs in wid_groups.items():
+        bounds = wid_bounds.get(wid)
+        if not bounds:
+            continue
+        left = bounds.get("left", 0)
+        top = bounds.get("top", 0)
+        width = bounds.get("width", 0)
+        height = bounds.get("height", 0)
+        state = bounds.get("windowState", "")
+        is_maximized = state in ("maximized", "fullscreen")
+
+        matched = None
+        for hw in windows:
+            hx, hy = hw["at"]
+            hw_w, hw_h = hw["size"]
+            if is_maximized:
+                if abs(hw_w - width) <= TOLERANCE and abs(hw_h - height) <= TOLERANCE:
+                    matched = hw
+                    break
+            else:
+                if (abs(hx - left) <= TOLERANCE and abs(hy - top) <= TOLERANCE
+                        and abs(hw_w - width) <= TOLERANCE and abs(hw_h - height) <= TOLERANCE):
+                    matched = hw
+                    break
+
+        if matched:
+            addr = matched.get("address")
+            wid_to_address[wid] = addr
+            print(f"  window at {matched['at']} ({len(group_tabs)} tab(s))")
+
+    # Build tab-to-crop mapping
     tab_to_address = {}
-    prev_focused = None
-    for wid, group in wid_groups.items():
-        first_tab = group[0]
-        await activate_tab(first_tab, browser_ws)
-        windows = get_brave_windows()
-        focused = get_focused_brave_window(windows)
-        if focused and focused.get("address") != prev_focused:
-            addr = focused.get("address")
-            prev_focused = addr
-            for t in group:
-                tab_to_address[t.get("id")] = addr
-            print(f"  window at {focused['at']} ({len(group)} tab(s))")
-        elif focused:
-            print(f"  Skipping window (no focus change)")
+    for tab in tabs:
+        tab_id = tab.get("id")
+        for wid, group_tabs in wid_groups.items():
+            if any(t.get("id") == tab_id for t in group_tabs):
+                addr = wid_to_address.get(wid)
+                if addr:
+                    tab_to_address[tab_id] = addr
+                break
 
-    # Restore original workspaces
-    for mon_name, ws_id in orig_workspaces.items():
-        subprocess.run(["hyprctl", "dispatch", "focusmonitor", mon_name], capture_output=True, timeout=2)
-        subprocess.run(["hyprctl", "dispatch", "workspace", str(ws_id)], capture_output=True, timeout=2)
-        print(f"  Restored {mon_name} to workspace {ws_id}")
-
-    # Build data URLs for each window's crop
+    # Inject data URLs per window
+    success = False
     addr_to_tabs = {}
     for tab in tabs:
         addr = tab_to_address.get(tab.get("id"))
         if addr:
             addr_to_tabs.setdefault(addr, []).append(tab)
 
-    # Inject data URLs per window
-    success = False
     for addr, group_tabs in addr_to_tabs.items():
         crop_path = CROPS_DIR / f"{addr}.png"
         if not crop_path.exists() or not crop_path.stat().st_size > 0:

@@ -44,6 +44,23 @@ def ensure_sanitized_dir(profile):
     return sanitized_dir
 
 
+def update_preferences(prefs_path, image_name):
+    try:
+        prefs = json.loads(prefs_path.read_text())
+    except Exception:
+        return False
+    bg = prefs.setdefault("brave", {}).setdefault("new_tab_page", {}).setdefault("background", {})
+    bg["type"] = "custom_image"
+    bg["selected_value"] = image_name
+    bg["random"] = False
+    prefs["brave"]["new_tab_page"]["show_background_image"] = True
+    try:
+        prefs_path.write_text(json.dumps(prefs, indent=2))
+        return True
+    except Exception:
+        return False
+
+
 def get_brave_windows():
     try:
         result = subprocess.run(
@@ -128,7 +145,11 @@ def sync_wallpaper():
             shutil.copy2(fallback_crop, dest_path)
         else:
             subprocess.run(["convert", str(wallpaper), str(dest_path)], capture_output=True, timeout=30)
-        print(f"Updated fallback for profile: {profile}")
+        prefs_path = BRAVE_CONFIG_DIR / profile / "Preferences"
+        if update_preferences(prefs_path, IMAGE_NAME):
+            print(f"Updated Preferences and fallback for profile: {profile}")
+        else:
+            print(f"Updated fallback for profile: {profile}")
 
     # Run the refresh script for per-tab injection
     if REFRESH_SCRIPT.exists():
