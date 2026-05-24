@@ -1,6 +1,7 @@
 [Unit]
 Description=Sync Omarchy wallpaper to Brave NTP background
-After=graphical-session.target
+After=wayland-session@hyprland.desktop.target
+BindsTo=wayland-session@hyprland.desktop.target
 
 [Service]
 Type=simple
@@ -9,4 +10,4 @@ Restart=on-failure
 RestartSec=5
 
 [Install]
-WantedBy=default.target
+WantedBy=wayland-session@hyprland.desktop.target

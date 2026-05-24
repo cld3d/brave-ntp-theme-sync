@@ -10,6 +10,14 @@ STABLE_COUNT=5
 POLL_INTERVAL=0.2
 SYNC_PID_FILE="/tmp/omarchy-brave-sync-running"
 
+# Wait for Hyprland environment (survives systemd env var race)
+for i in $(seq 1 60); do
+    if [[ -n $HYPRLAND_INSTANCE_SIGNATURE ]]; then
+        break
+    fi
+    sleep 0.5
+done
+
 if [[ ! -L $WALLPAPER_LINK ]]; then
     echo "Omarchy wallpaper link not found: $WALLPAPER_LINK"
     exit 1
